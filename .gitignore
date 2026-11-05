@@ -1,0 +1,13 @@
+# runtime state / secrets — never commit these
+config.json
+data.json
+bot.log
+keeper.log
+run.log
+.bot_ok
+instances/
+libs/
+__pycache__/
+*.pyc
+*.pid
+*.log

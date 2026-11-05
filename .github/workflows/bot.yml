@@ -1,0 +1,162 @@
+name: Telegram Bot 24/7
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/20 * * * *"
+  repository_dispatch:
+    types: [bootstrap-bot, restart-bot]
+
+concurrency:
+  group: tg-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore latest state (cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            config.json
+            data.json
+            instances
+          key: tgstate-${{ github.run_id }}-restore
+          restore-keys: tgstate-
+
+      - name: Clean stale pid files
+        run: rm -f instances/*.pid
+
+      - name: Bootstrap state (dispatch payload or BOT_STATE secret)
+        env:
+          BOT_STATE: ${{ secrets.BOT_STATE }}
+        run: python3 scripts/bootstrap_restore.py
+
+      - name: Verify state present
+        run: |
+          rm -f .bot_ok
+          if [ ! -f config.json ]; then
+            echo "::error::No bot state found! Trigger a 'bootstrap-bot' repository_dispatch with client_payload.state_b64 (or create the BOT_STATE secret)."
+            exit 1
+          fi
+
+      - name: Run bot - chunk 1
+        run: bash scripts/run_chunk.sh 15
+
+      - name: Save state - 1
+        if: always() && hashFiles('config.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            config.json
+            data.json
+            instances
+          key: tgstate-${{ github.run_id }}-1
+
+      - name: Run bot - chunk 2
+        run: bash scripts/run_chunk.sh 55
+
+      - name: Save state - 2
+        if: always() && hashFiles('config.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            config.json
+            data.json
+            instances
+          key: tgstate-${{ github.run_id }}-2
+
+      - name: Run bot - chunk 3
+        run: bash scripts/run_chunk.sh 55
+
+      - name: Save state - 3
+        if: always() && hashFiles('config.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            config.json
+            data.json
+            instances
+          key: tgstate-${{ github.run_id }}-3
+
+      - name: Run bot - chunk 4
+        run: bash scripts/run_chunk.sh 55
+
+      - name: Save state - 4
+        if: always() && hashFiles('config.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            config.json
+            data.json
+            instances
+          key: tgstate-${{ github.run_id }}-4
+
+      - name: Run bot - chunk 5
+        run: bash scripts/run_chunk.sh 55
+
+      - name: Save state - 5
+        if: always() && hashFiles('config.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            config.json
+            data.json
+            instances
+          key: tgstate-${{ github.run_id }}-5
+
+      - name: Run bot - chunk 6
+        run: bash scripts/run_chunk.sh 55
+
+      - name: Save state - 6
+        if: always() && hashFiles('config.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            config.json
+            data.json
+            instances
+          key: tgstate-${{ github.run_id }}-6
+
+      - name: Retrigger next run (self-healing chain)
+        if: success() && hashFiles('.bot_ok') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in 1 2 3; do
+            if curl -sS -f -X POST \
+                 -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/vnd.github+json" \
+                 "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+                 -d '{"event_type":"restart-bot"}'; then
+              echo "next run triggered"
+              break
+            fi
+            echo "dispatch attempt $i failed"
+            sleep 10
+          done
+
+      - name: Daily heartbeat commit
+        if: success() && hashFiles('.bot_ok') != ''
+        run: bash scripts/heartbeat.sh
