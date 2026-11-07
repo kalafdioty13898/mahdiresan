@@ -1,13 +1,14 @@
-# runtime state / secrets — never commit these
+# داده‌های محلی هرگز نباید plaintext وارد ریپو شوند (فقط state.enc رمزنگاری‌شده)
 config.json
 data.json
-bot.log
-keeper.log
+instances/*/config.json
+instances/*/data.json
+instances/*.pid
+instances/*.log
+.state_key
+*.tgz
 run.log
-.bot_ok
-instances/
-libs/
+bot.log
+bot.log.*
 __pycache__/
 *.pyc
-*.pid
-*.log
