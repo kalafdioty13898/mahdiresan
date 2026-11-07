@@ -90,12 +90,14 @@ jobs:
           timeout 45 python -u bot.py > selftest.log 2>&1; RC=$?
           echo "─── خروجی بوت در self-test:"
           tail -n 25 selftest.log || true
-          if [ "$RC" -ne 124 ]; then
-            echo "❌ SELF-TEST FAILED (rc=$RC)"
+          # ✅ معیار درست: «bot online» در لاگ = بوت سالم (PTB هنگام SIGTERM خروج تمیز rc=0 می‌دهد)
+          if grep -q "bot online" selftest.log; then
+            echo "✅ self-test OK — بوت آنلاین شد، حالا اجرای دائمی:"
+          else
+            echo "❌ SELF-TEST FAILED (rc=$RC) — «bot online» دیده نشد"
             exit 1
           fi
           sleep 3
-          echo "✅ self-test OK — بوت سالم است، حالا اجرای دائمی:"
 
       - name: Run bot (24/7 keep-alive loop)
         run: |
