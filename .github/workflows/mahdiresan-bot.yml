@@ -1,0 +1,66 @@
+name: mahdiresan-bot
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 */6 * * *"   # پشتیبان: هر ۶ ساعت (اجرای اصلی خودش اجرای بعدی را dispatch می‌کند)
+concurrency:
+  group: mahdiresan-run
+  cancel-in-progress: false
+permissions:
+  contents: write
+  actions: write
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install "python-telegram-bot~=21.11"
+
+      - name: Restore encrypted state
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -in state.enc -out state.tgz -pass env:STATE_KEY
+          tar xzf state.tgz
+          rm -f state.tgz
+          echo "✅ state restored (config.json, data.json, instances/)"
+
+      - name: Run bot (24/7 keep-alive loop)
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          # 🔄 ذخیره state هر ۱۵ دقیقه (پایداری data.json)
+          (
+            while true; do
+              sleep 900
+              bash push_state.sh || true
+            done
+          ) &
+          # 🤖 حلقه نگهدارنده — اگر بات خطا داد، ۱۰ ثانیه بعد دوباره بالا می‌آید
+          while true; do
+            python bot.py >> run.log 2>&1 || true
+            echo "$(date -u '+%FT%TZ') bot exited — restart in 10s" >> run.log
+            sleep 10
+          done
+
+      - name: Final state push + start next run (24/7 chain)
+        if: always()
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash push_state.sh || true
+          sleep 5
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/mahdiresan-bot.yml/dispatches" \
+            -d '{"ref":"main"}' || true
+          echo "next run dispatched"
