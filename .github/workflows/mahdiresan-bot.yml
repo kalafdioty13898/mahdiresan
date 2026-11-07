@@ -1,13 +1,18 @@
 name: mahdiresan-bot
 on:
   workflow_dispatch:
+    inputs:
+      state_b64:
+        description: "base64(tar.gz) state — از اجرای قبلی"
+        required: false
+        default: ""
   schedule:
-    - cron: "37 */6 * * *"   # پشتیبان: هر ۶ ساعت (اجرای اصلی خودش اجرای بعدی را dispatch می‌کند)
+    - cron: "23 */12 * * *"   # نجات: اگر زنجیره قطع شده باشد، هر ۱۲ ساعت ربات را برمی‌گرداند
 concurrency:
   group: mahdiresan-run
   cancel-in-progress: false
 permissions:
-  contents: write
+  contents: read
   actions: write
 jobs:
   bot:
@@ -23,44 +28,94 @@ jobs:
       - name: Install dependencies
         run: pip install "python-telegram-bot~=21.11"
 
-      - name: Restore encrypted state
+      - name: Skip redundant scheduled run (chain is healthy)
+        if: inputs.state_b64 == ''
         env:
-          STATE_KEY: ${{ secrets.STATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          openssl enc -d -aes-256-cbc -pbkdf2 -in state.enc -out state.tgz -pass env:STATE_KEY
-          tar xzf state.tgz
-          rm -f state.tgz
-          echo "✅ state restored (config.json, data.json, instances/)"
+          A=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=botstate&per_page=1")
+          AGE_H=$(( ($(date +%s) - $(echo "$A" | jq -r '.artifacts[0].created_at // empty' | xargs -r date -d - +%s 2>/dev/null || echo 0)) / 3600 ))
+          if [ "$(echo "$A" | jq -r '.total_count // 0')" -gt 0 ] && [ "$AGE_H" -lt 7 ]; then
+            echo "chain is healthy (artifact ${AGE_H}h old) — cancelling this redundant run"
+            gh run cancel "${{ github.run_id }}" --repo "${GITHUB_REPOSITORY}" || true
+            sleep 30
+          fi
+
+      - name: Find previous state artifact
+        if: inputs.state_b64 == ''
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=botstate&per_page=1" \
+            | jq -r '.artifacts[0].run_id // empty')
+          echo "run_id=$RID" >> "$GITHUB_OUTPUT"
+
+      - name: Restore state (dispatch input → artifact → fresh)
+        env:
+          STATE_B64: ${{ inputs.state_b64 }}
+          GH_TOKEN: ${{ github.token }}
+          PREV_RUN: ${{ steps.find.outputs.run_id }}
+        run: |
+          if [ -n "$STATE_B64" ]; then
+            echo "$STATE_B64" | base64 -d > state.tgz
+            echo "✅ state از اجرای قبلی (dispatch chain) بازیابی شد"
+          elif [ -n "$PREV_RUN" ]; then
+            AID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=botstate&per_page=1" \
+              | jq -r '.artifacts[0].id')
+            curl -sL -H "Authorization: Bearer $GH_TOKEN" -o a.zip \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/$AID/zip"
+            unzip -o -q a.zip -d restored
+            mv restored/state.tgz state.tgz 2>/dev/null || true
+            rm -rf restored a.zip
+            echo "✅ state از artifact پشتیبان بازیابی شد"
+          else
+            echo "⚠️ state قبلی پیدا نشد — شروع با دیتای خالی"
+          fi
+          if [ -f state.tgz ]; then
+            tar xzf state.tgz && rm -f state.tgz
+            echo "state restored:"
+            ls -la
+          fi
 
       - name: Run bot (24/7 keep-alive loop)
-        env:
-          STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
-          # 🔄 ذخیره state هر ۱۵ دقیقه (پایداری data.json)
-          (
-            while true; do
-              sleep 900
-              bash push_state.sh || true
-            done
-          ) &
-          # 🤖 حلقه نگهدارنده — اگر بات خطا داد، ۱۰ ثانیه بعد دوباره بالا می‌آید
-          while true; do
+          DEADLINE=$((SECONDS + 19200))
+          while [ $SECONDS -lt $DEADLINE ]; do
             python bot.py >> run.log 2>&1 || true
             echo "$(date -u '+%FT%TZ') bot exited — restart in 10s" >> run.log
             sleep 10
           done
+          echo "clean deadline exit — passing state to next run"
 
-      - name: Final state push + start next run (24/7 chain)
+      - name: Save state artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: botstate
+          retention-days: 1
+          if-no-files-found: ignore
+          path: |
+            config.json
+            data.json
+            instances/*/config.json
+            instances/*/data.json
+
+      - name: Start next run with current state (24/7 chain)
         if: always()
         env:
-          STATE_KEY: ${{ secrets.STATE_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          bash push_state.sh || true
-          sleep 5
-          curl -s -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
+          tar czf state.tgz config.json data.json instances/*/config.json instances/*/data.json 2>/dev/null \
+            || tar czf state.tgz config.json data.json
+          B64=$(base64 -w0 state.tgz)
+          jq -n --arg s "$B64" '{"ref":"main","inputs":{"state_b64":$s}}' > payload.json
+          CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/mahdiresan-bot.yml/dispatches" \
-            -d '{"ref":"main"}' || true
-          echo "next run dispatched"
+            --data @payload.json)
+          echo "dispatch next run: HTTP $CODE"
+          rm -f state.tgz payload.json
