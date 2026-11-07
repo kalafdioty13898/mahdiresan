@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -150,7 +151,8 @@ BTN_MYBOTS = "📋 بات‌های من"
 def panel_kb():
     rows = [[BTN_BROADCAST, BTN_FJ],
             [BTN_FC, BTN_POWER],
-            [BTN_STATS]]
+            [BTN_STATS, BTN_SYS_STATS],
+            [BTN_VIP]]
     if DEPTH == 0:
         rows.append([BTN_NEWBOT])
         rows.append([BTN_MYBOTS])
@@ -228,11 +230,15 @@ def add_user(u):
         return
     key = str(u.id)
     info = DATA["users"].get(key, {})
+    is_new = not info
     info["name"] = u.first_name or ""
     info["username"] = ("@" + u.username) if u.username else ""
     info.setdefault("joined", jdate_only())
     info.setdefault("msgs", 0)
     DATA["users"][key] = info
+    if is_new:
+        ds = day_stats()
+        ds["new_users"] = ds.get("new_users", 0) + 1
     save_data()
 
 async def send(context, chat_id, text, **kw):
@@ -355,7 +361,8 @@ def users_list_panel(page: int = 0):
     for uid_s in ids[page * per:(page + 1) * per]:
         u = users.get(uid_s, {})
         nm = u.get("name") or "—"
-        prefix = "🚫 " if int(uid_s) in DATA["blocked"] else "👤 "
+        _uu = int(uid_s)
+        prefix = "💎 " if _uu in DATA.get("vip", []) else ("🚫 " if _uu in DATA["blocked"] else "👤 ")
         kb.append([
             InlineKeyboardButton("ℹ️ اطلاعات کاربر", callback_data=f"uinfo:{uid_s}:{page}"),
             InlineKeyboardButton(f"{prefix}{nm[:18]}", callback_data="noop"),
@@ -413,7 +420,8 @@ def search_results_panel(q: str, res):
     for uid_s in res:
         u = DATA["users"].get(uid_s, {})
         nm = u.get("name") or "—"
-        prefix = "🚫 " if int(uid_s) in DATA["blocked"] else "👤 "
+        _uu = int(uid_s)
+        prefix = "💎 " if _uu in DATA.get("vip", []) else ("🚫 " if _uu in DATA["blocked"] else "👤 ")
         kb.append([
             InlineKeyboardButton("ℹ️ اطلاعات کاربر", callback_data=f"uinfo:{uid_s}:0"),
             InlineKeyboardButton(f"{prefix}{nm[:18]}", callback_data="noop"),
@@ -453,7 +461,7 @@ async def send_welcome(context, chat):
           f"هر پیامی داری بفرست، ناشناس ارسال میشه برای {admin_disp} 🕊️")
     t2 = ("✨ دیگه نیازی نیست هر دفعه ربات رو استارت کنی!\n"
           "همینجا هر پیامی که داری بفرست، خودم متوجه میشم میخوای برای کی ارسال کنی 🤠")
-    await send(context, chat.id, t1)
+    await send(context, chat.id, t1, reply_markup=user_kb())
     await send(context, chat.id, t2)
 
 def save_last_reply(uid: int, rec: dict):
@@ -463,6 +471,432 @@ def save_last_reply(uid: int, rec: dict):
         for k in list(lr.keys())[: len(lr) - 100]:
             lr.pop(k, None)
     save_data()
+
+# ============================================================
+# ✨ آپدیت v5 — لینک ناشناس اختصاصی + VIP + آمار + امنیت
+# ============================================================
+BTN_MY_LINK = "🔗 دریافت ناشناس من"
+BTN_MY_PANEL = "📊 پنل مدیریت"
+BTN_VIP = "💎 کاربران VIP"
+BTN_SYS_STATS = "📈 آمار ربات"
+
+_cfg_rl = CFG.get("rate_limit") or {}
+RATE_PER_MIN = int(_cfg_rl.get("per_minute", 6))
+RATE_PER_HOUR = int(_cfg_rl.get("per_hour", 30))
+_RATE_HITS = {}
+
+INVALID_LINK_TEXT = "❌ این لینک ناشناس معتبر نیست یا دیگر فعال نیست."
+SELF_LINK_TEXT = "🙃 شما نمی‌توانید از لینک ناشناس خودتان برای ارسال پیام به خودتان استفاده کنید!"
+RATE_TEXT = "⚠️ یه کم آروم‌تر! ⏳ چند لحظه صبر کن بعد دوباره پیام بده 🙏"
+SENT_LINK_TEXT = "✅ پیامت به‌صورت ناشناس ارسال شد 🕊️"
+LINK_FAIL_TEXT = "⚠️ ارسال نشد! احتمالاً صاحب لینک هنوز ربات رو استارت نکرده یا بلاکش کرده 😕"
+OWNER_REPLY_FAIL = "⚠️ ارسال نشد! احتمالاً طرف مقابل ربات رو بلاک کرده 😕"
+OWNER_NEW_MSG = "📩 <b>پیام ناشناس جدید</b>\n"
+THREAD_GONE_TEXT = "⚠️ این گفتگو دیگه در دسترس نیست!"
+
+def get_role(uid: int) -> str:
+    """نقش کاربر — همیشه در بک‌اند چک میشه (user / vip / admin)"""
+    if is_admin(uid):
+        return "admin"
+    if uid in DATA.get("vip", []):
+        return "vip"
+    return "user"
+
+def g_today() -> str:
+    return datetime.now(TEHRAN).strftime("%Y-%m-%d")
+
+def _last_days(n: int):
+    base = datetime.now(TEHRAN).date()
+    return {(base - timedelta(days=i)).isoformat() for i in range(n)}
+
+def prune_sorted_days(dd: dict, keep: int):
+    if len(dd) <= keep:
+        return
+    for k in sorted(dd.keys())[: len(dd) - keep]:
+        dd.pop(k, None)
+
+def day_stats(date: str = None) -> dict:
+    date = date or g_today()
+    return DATA.setdefault("daily", {}).setdefault(
+        date, {"msgs": 0, "views": 0, "new_users": 0, "active": []})
+
+def migrate_data():
+    """مهاجرت امن دیتا — فقط کلیدهای جدید اضافه می‌شه؛ هیچ داده قدیمی حذف/تغییر نمی‌کنه"""
+    d = DATA
+    d.setdefault("vip", [])
+    d.setdefault("links", {})
+    d.setdefault("link_by_uid", {})
+    d.setdefault("osrc_map", {})
+    d.setdefault("pending_target", {})
+    d.setdefault("owner_views", {})
+    d.setdefault("view_log", {})
+    d.setdefault("daily", {})
+    st = d.setdefault("stats", {"total": 0, "today": 0, "day": ""})
+    st.setdefault("views_total", 0)
+    st.setdefault("views_today", 0)
+    st.setdefault("views_day", "")
+    for u in d.get("users", {}).values():
+        u.setdefault("recv_total", 0)
+        u.setdefault("recv_daily", {})
+    prune_sorted_days(d["daily"], 90)
+    prune_sorted_days(d["view_log"], 30)
+    for u in d.get("users", {}).values():
+        prune_sorted_days(u.get("recv_daily", {}), 40)
+    save_data()
+
+migrate_data()
+
+def bump_daily_msgs(uid: int):
+    """شمارش پیام روز + کاربر فعال امروز (sync — بدون await → بدون Race Condition)"""
+    ds = day_stats()
+    ds["msgs"] = ds.get("msgs", 0) + 1
+    act = ds.setdefault("active", [])
+    su = str(uid)
+    if su not in act:
+        act.append(su)
+
+def add_view(owner_uid: int, visitor_uid: int) -> bool:
+    """ثبت بازدید لینک — هر بازدیدکننده در هر روز فقط یک‌بار (True = شمرده شد)"""
+    date = g_today()
+    vl = DATA.setdefault("view_log", {})
+    okey, vkey = str(owner_uid), str(visitor_uid)
+    visitors = vl.setdefault(date, {}).setdefault(okey, [])
+    if vkey in visitors:
+        return False
+    if len(visitors) < 10000:
+        visitors.append(vkey)
+    prune_sorted_days(vl, 30)
+    ov = DATA.setdefault("owner_views", {}).setdefault(okey, {})
+    if ov.get("day") != date:
+        ov["day"] = date
+        ov["today"] = 0
+    ov["today"] = ov.get("today", 0) + 1
+    ov["total"] = ov.get("total", 0) + 1
+    st = DATA.setdefault("stats", {})
+    if st.get("views_day") != date:
+        st["views_day"] = date
+        st["views_today"] = 0
+    st["views_today"] = st.get("views_today", 0) + 1
+    st["views_total"] = st.get("views_total", 0) + 1
+    ds = day_stats(date)
+    ds["views"] = ds.get("views", 0) + 1
+    save_data()
+    return True
+
+def gen_token() -> str:
+    """توکن تصادفی و غیرقابل حدس — بدون user_id/username/timestamp — با چک تکراری"""
+    for _ in range(50):
+        tok = secrets.token_urlsafe(16)
+        if tok not in DATA.get("links", {}):
+            return tok
+    raise RuntimeError("token collision after 50 tries")
+
+def link_url(tok: str) -> str:
+    un = BOT_INFO.get("username") or "bot"
+    return f"https://t.me/{un}?start={tok}"
+
+def get_or_create_link(uid: int):
+    """لینک پایدار هر کاربر — هرگز برای همان کاربر دوباره ساخته نمی‌شود"""
+    lbu = DATA.setdefault("link_by_uid", {})
+    tok = lbu.get(str(uid))
+    if tok and tok in DATA.get("links", {}):
+        return tok, DATA["links"][tok]
+    tok = gen_token()
+    DATA["links"][tok] = {"owner": uid, "enabled": True, "created": jdate_only()}
+    lbu[str(uid)] = tok
+    save_data()
+    log.info(f"🔗 link created owner={uid} token={tok[:4]}…")
+    return tok, DATA["links"][tok]
+
+def owner_display(owner_uid: int) -> str:
+    u = DATA["users"].get(str(owner_uid), {})
+    if u.get("name"):
+        return html.escape(u["name"])
+    if owner_uid == ADMIN_ID:
+        return admin_display()
+    return "دوست شما"
+
+def user_kb():
+    return ReplyKeyboardMarkup([[BTN_MY_LINK], [BTN_MY_PANEL]], resize_keyboard=True)
+
+def rate_limited(uid: int) -> bool:
+    """Rate Limit — مقادیر از کانفیگ (rate_limit.per_minute / per_hour)"""
+    if is_admin(uid):
+        return False
+    now = time.time()
+    hits = _RATE_HITS.setdefault(uid, [])
+    hits[:] = [t for t in hits if now - t < 3600]
+    if sum(1 for t in hits if now - t < 60) >= RATE_PER_MIN:
+        return True
+    if len(hits) >= RATE_PER_HOUR:
+        return True
+    hits.append(now)
+    return False
+
+def owner_recv_kb(key: str):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ پاسخ", callback_data=f"rpo:{key}")]])
+
+def owner_recv_stats(uid: int) -> dict:
+    u = DATA["users"].get(str(uid), {})
+    rd = u.get("recv_daily", {})
+    today = g_today()
+    return {
+        "today": rd.get(today, 0),
+        "week": sum(v for k, v in rd.items() if k in _last_days(7)),
+        "month": sum(v for k, v in rd.items() if k.startswith(today[:7])),
+        "total": u.get("recv_total", 0),
+    }
+
+async def handle_my_link(update, context, u):
+    """دکمه «دریافت ناشناس من» — ثبت‌نام در صورت نبود + نمایش لینک پایدار"""
+    add_user(u)
+    tok, rec = get_or_create_link(u.id)
+    url = link_url(tok)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📤 اشتراک‌گذاری لینک", url=f"https://t.me/share/url?url={url}")]])
+    txt = (f"🔗 <b>لینک ناشناس اختصاصی شما:</b>\n\n"
+           f"<code>{html.escape(url)}</code>\n\n"
+           "هر کسی با این لینک وارد ربات بشه، پیامش ناشناس مستقیم به شما می‌رسه 🕊️\n"
+           "🔗 این لینک همیشه ثابته و تغییر نمی‌کنه ✅")
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+async def handle_my_panel(update, context, u):
+    """دکمه «پنل مدیریت» — ادمین: پنل ادمین | کاربر/VIP: آمار شخصی خودش"""
+    role = get_role(u.id)
+    if role == "admin":
+        STATES.pop(u.id, None)
+        await update.message.reply_text(
+            "🎛 <b>پنل ادمین</b> 👇", parse_mode=ParseMode.HTML, reply_markup=panel_kb())
+        return
+    rs = owner_recv_stats(u.id)
+    ov = DATA.get("owner_views", {}).get(str(u.id), {})
+    if role == "vip":
+        txt = (f"📊 <b>آمار من (VIP 💎)</b>\n\n"
+               f"📨 پیام‌های امروز: {rs['today']}\n"
+               f"📨 پیام‌های این هفته: {rs['week']}\n"
+               f"📨 پیام‌های این ماه: {rs['month']}\n"
+               f"📨 کل پیام‌های دریافتی: {rs['total']}\n\n"
+               f"👀 بازدید لینک امروز: {ov.get('today', 0)}\n"
+               f"👀 کل بازدید لینک: {ov.get('total', 0)}")
+    else:
+        txt = (f"📊 <b>آمار من</b>\n\n"
+               f"📨 پیام‌های امروز: {rs['today']}\n"
+               f"📨 کل پیام‌های دریافتی: {rs['total']}\n\n"
+               f"👀 بازدیدهای لینک: {ov.get('total', 0)}")
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+async def handle_link_entry(update, context, u, token_arg: str):
+    """ورود با Deep Link (start=token) — اعتبارسنجی کامل توکن در بک‌اند"""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", token_arg):
+        await update.message.reply_text(INVALID_LINK_TEXT)
+        return
+    rec = DATA.get("links", {}).get(token_arg)
+    if not rec:
+        await update.message.reply_text(INVALID_LINK_TEXT)
+        return
+    owner = int(rec.get("owner", 0))
+    if not rec.get("enabled", True) or (str(owner) not in DATA["users"] and owner != ADMIN_ID):
+        await update.message.reply_text(INVALID_LINK_TEXT)
+        return
+    if u.id == owner:
+        await update.message.reply_text(SELF_LINK_TEXT, reply_markup=user_kb())
+        return
+    DATA.setdefault("pending_target", {})[str(u.id)] = owner
+    add_view(owner, u.id)
+    name = owner_display(owner)
+    await update.message.reply_text(
+        f"درود 👋\n\n"
+        f"اینجا هر پیامی رو بفرستی مستقیم برای <b>{name}</b> ارسال میشه؛ به صورت ناشناس 🕊️\n\n"
+        "✍️ پیام خودت رو ارسال کن.",
+        parse_mode=ParseMode.HTML, reply_markup=user_kb())
+
+async def send_to_owner(update, context, u, owner_uid: int, thread_ref: int = None):
+    """ارسال پیام ناشناس برای صاحب لینک — اطلاعات فرستنده فقط برای VIP (چک بک‌اند)"""
+    msg = update.message
+    chat_id = update.effective_chat.id
+    owner_uid = int(owner_uid)
+    role = get_role(owner_uid)
+    uname = ("@" + u.username) if u.username else ""
+    uinfo0 = DATA["users"].get(str(u.id), {})
+    shown_msgs = uinfo0.get("msgs", 0) + 1
+    try:
+        if role in ("vip", "admin"):
+            info = (f"━━━━━━━━━━━━\n"
+                    f"👤 <b>اطلاعات فرستنده:</b>\n"
+                    f"🔗 یوزرنیم: {html.escape(uname or 'نداره')}\n"
+                    f"📛 اسم: {html.escape(u.first_name or '—')}\n"
+                    f"🆔 آیدی عددی: <code>{u.id}</code>\n"
+                    f"💌 تعداد پیام‌های این کاربر: {shown_msgs}\n")
+        else:
+            info = ""  # 🔒 کاربر عادی: هیچ اطلاعات هویتی از فرستنده نمایش داده نمی‌شه
+        header = OWNER_NEW_MSG + info
+        if thread_ref:
+            try:
+                await send(context, owner_uid, header,
+                           reply_to_message_id=thread_ref, allow_sending_without_reply=True)
+            except Exception:
+                await send(context, owner_uid, header)
+        else:
+            await send(context, owner_uid, header)
+        key = f"{chat_id}_{msg.message_id}"
+        res = await context.bot.copy_message(owner_uid, chat_id, msg.message_id,
+                                             reply_markup=owner_recv_kb(key))
+        osm = DATA.setdefault("osrc_map", {})
+        osm[key] = {"owner": owner_uid, "chat": chat_id, "mid": msg.message_id,
+                    "date": date_str(), "omid": res.message_id}
+        if len(osm) > 500:
+            for k in list(osm.keys())[: len(osm) - 500]:
+                osm.pop(k, None)
+        # 📊 شمارنده‌ها — بلوک sync بدون await بین خواندن و نوشتن (بدون Race Condition)
+        sinfo = DATA["users"].setdefault(str(u.id), {})
+        sinfo["msgs"] = sinfo.get("msgs", 0) + 1
+        sinfo["last_msg"] = jdate_only()
+        oinfo = DATA["users"].setdefault(str(owner_uid), {})
+        oinfo["recv_total"] = oinfo.get("recv_total", 0) + 1
+        rd = oinfo.setdefault("recv_daily", {})
+        td = g_today()
+        rd[td] = rd.get(td, 0) + 1
+        prune_sorted_days(rd, 40)
+        sts = DATA.setdefault("stats", {"total": 0, "today": 0, "day": ""})
+        if sts.get("day") != td:
+            sts["day"] = td
+            sts["today"] = 0
+        sts["total"] = sts.get("total", 0) + 1
+        sts["today"] = sts.get("today", 0) + 1
+        bump_daily_msgs(u.id)
+        save_data()
+        await msg.reply_text(SENT_LINK_TEXT, reply_markup=user_kb())
+    except Exception as e:
+        log.warning(f"send to owner {owner_uid} failed: {e}")
+        try:
+            await msg.reply_text(LINK_FAIL_TEXT)
+        except Exception:
+            pass
+
+async def do_owner_reply(update, context, u, key: str):
+    """پاسخ صاحب لینک به پیام ناشناس (دکمه rpo) — پاسخ ناشناس به فرستنده می‌رسه"""
+    msg = update.message
+    ent = DATA.get("osrc_map", {}).get(key)
+    STATES.pop(u.id, None)
+    if not ent:
+        await msg.reply_text(THREAD_GONE_TEXT)
+        return
+    try:
+        await send(context, ent["chat"], f"💬 <b>{owner_display(u.id)}</b> جواب داد :")
+        res = await context.bot.copy_message(ent["chat"], msg.chat_id, msg.message_id)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "↩️ پاسخ", callback_data=f"rpuo:{res.message_id}:{key}")]])
+        await context.bot.edit_message_reply_markup(ent["chat"], res.message_id, reply_markup=kb)
+        await msg.reply_text("✅ پاسخت ارسال شد 🕊️")
+    except Exception as e:
+        log.warning(f"owner reply failed: {e}")
+        await msg.reply_text(OWNER_REPLY_FAIL)
+
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u or not update.effective_chat or update.effective_chat.type != Chat.PRIVATE:
+        return
+    if get_role(u.id) == "admin":
+        await update.message.reply_text(
+            "ℹ️ رئیس، همه پیام‌ها خودکار برای تو میاد؛ لینک ناشناس مخصوص کاربرانinale!")
+        return
+    await handle_my_link(update, context, u)
+
+# ---------- پنل VIP ادمین ----------
+def vip_panel():
+    n = len(DATA.get("vip", []))
+    txt = (f"💎 <b>مدیریت کاربران VIP</b>\n\n"
+           f"تعداد VIP: {n}\n\n"
+           "💎 VIP علاوه بر امکانات کاربر عادی، <b>اطلاعات فرستنده</b> پیام‌های لینکش و "
+           "<b>آمار پیشرفته</b> رو می‌بینه.\n"
+           "➕ افزودن با آیدی عددی انجام می‌شه.")
+    kb = [[InlineKeyboardButton("➕ افزودن VIP", callback_data="vip_add"),
+           InlineKeyboardButton("📋 لیست VIP", callback_data="vip_list")],
+          [InlineKeyboardButton("🔍 جستجوی VIP", callback_data="vip_search"),
+           InlineKeyboardButton("🔙 برگشت", callback_data="vip_back")]]
+    return txt, InlineKeyboardMarkup(kb)
+
+def vip_list_panel(page: int = 0):
+    vips = DATA.get("vip", [])
+    per = 10
+    pages = max(1, (len(vips) + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    txt = f"📋 <b>لیست کاربران VIP</b> — صفحه {page + 1} از {pages} ({len(vips)} نفر):"
+    kb = []
+    for uid in vips[page * per:(page + 1) * per]:
+        nm = DATA["users"].get(str(uid), {}).get("name") or "—"
+        kb.append([InlineKeyboardButton(f"💎 {nm[:18]}", callback_data=f"vip_info:{uid}"),
+                   InlineKeyboardButton("➖ حذف", callback_data=f"vip_del:{uid}")])
+    if not kb:
+        txt = "📋 <b>لیست کاربران VIP</b>\n\nهنوز هیچ VIP ای اضافه نشده!"
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("««", callback_data=f"vip_page:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("»»", callback_data=f"vip_page:{page + 1}"))
+    if len(nav) > 1:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("🔙 برگشت", callback_data="vip_back")])
+    return txt, InlineKeyboardMarkup(kb)
+
+def vip_info_panel(uid: int):
+    u = DATA["users"].get(str(uid), {})
+    rs = owner_recv_stats(uid)
+    ov = DATA.get("owner_views", {}).get(str(uid), {})
+    is_vip = uid in DATA.get("vip", [])
+    blocked = uid in DATA["blocked"]
+    tok = DATA.get("link_by_uid", {}).get(str(uid))
+    txt = (f"👤 <b>اطلاعات کاربر VIP</b>\n\n"
+           f"📛 اسم: {html.escape(u.get('name') or '—')}\n"
+           f"🔗 یوزرنیم: {html.escape(u.get('username') or 'نداره')}\n"
+           f"🆔 آیدی عددی: <code>{uid}</code>\n"
+           f"📅 تاریخ عضویت: {u.get('joined', '—')}\n"
+           f"وضعیت VIP: {'💎 VIP' if is_vip else 'کاربر عادی'}\n"
+           f"وضعیت حساب: {'🚫 بلاک شده' if blocked else '✅ فعال'}\n\n"
+           f"📨 پیام‌های امروز: {rs['today']}\n"
+           f"📨 کل پیام‌های دریافتی: {rs['total']}\n\n"
+           f"👀 بازدید لینک امروز: {ov.get('today', 0)}\n"
+           f"👀 کل بازدید لینک: {ov.get('total', 0)}\n\n"
+           f"🗓 آخرین فعالیت: {u.get('last_msg', '—')}\n"
+           f"🔗 لینک ناشناس: {'داره ✅' if tok else 'نداره ❌'}")
+    kb = []
+    if is_vip:
+        kb.append([InlineKeyboardButton("➖ حذف VIP", callback_data=f"vip_del:{uid}")])
+    else:
+        kb.append([InlineKeyboardButton("➕ افزودن به VIP", callback_data="vip_add")])
+    kb.append([InlineKeyboardButton("🔙 برگشت به لیست", callback_data="vip_list")])
+    return txt, InlineKeyboardMarkup(kb)
+
+def admin_stats_panel():
+    """آمار کلی سیستم — فقط ادمین"""
+    today = g_today()
+    users = DATA["users"]
+    st = DATA.setdefault("stats", {})
+    ds = DATA.get("daily", {})
+    d0 = ds.get(today, {})
+    new_today = sum(1 for u in users.values() if u.get("joined") == jdate_only())
+    lines = []
+    for k in sorted(ds.keys())[-7:]:
+        m = ds[k].get("msgs", 0)
+        v = ds[k].get("views", 0)
+        lines.append(f"<code>{k[5:]}</code> | 📨 {m:<4} | 👀 {v:<4} {'▮' * min(m, 18)}")
+    week = sum(ds[k].get("msgs", 0) for k in ds if k in _last_days(7))
+    month = sum(ds[k].get("msgs", 0) for k in ds if k.startswith(today[:7]))
+    txt = (f"📈 <b>آمار کلی ربات</b>\n\n"
+           f"👥 کل کاربران: {len(users)}\n"
+           f"🆕 کاربران جدید امروز: {new_today}\n"
+           f"🟢 کاربران فعال امروز: {len(d0.get('active', []))}\n\n"
+           f"📨 پیام‌های امروز: {st.get('today', 0)}\n"
+           f"📨 کل پیام‌ها: {st.get('total', 0)}\n"
+           f"📨 این هفته: {week} | 📨 این ماه: {month}\n\n"
+           f"💎 کاربران VIP: {len(DATA.get('vip', []))}\n\n"
+           f"👀 بازدید لینک امروز: {st.get('views_today', 0)}\n"
+           f"👀 کل بازدیدها: {st.get('views_total', 0)}")
+    if lines:
+        txt += "\n\n🗓 <b>۷ روز اخیر:</b>\n" + "\n".join(lines)
+    kb = [[InlineKeyboardButton("🔙 برگشت به پنل", callback_data="back_panel")]]
+    return txt, InlineKeyboardMarkup(kb)
 
 # ---------------- چند-بات (instances) ----------------
 def inst_safe(name: str) -> str:
@@ -570,18 +1004,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(LOCK_TEXT, parse_mode=ParseMode.HTML,
                                         reply_markup=build_lock_kb())
         return
+    # ✨ ورود با لینک ناشناس اختصاصی (Deep Link)
+    _args = context.args or []
+    if _args and isinstance(_args[0], str) and len(_args[0]) >= 8:
+        await handle_link_entry(update, context, u, _args[0].strip())
+        return
     await send_welcome(context, update.effective_chat)
 
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not u:
         return
-    if is_admin(u.id):
+    if get_role(u.id) == "admin":
         STATES.pop(ADMIN_ID, None)
         await update.message.reply_text("🎛 <b>پنل ادمین</b> 👇", parse_mode=ParseMode.HTML,
                                         reply_markup=panel_kb())
     else:
-        await update.message.reply_text("🔒 این بخش مخصوص ادمینه! 🤭")
+        await handle_my_panel(update, context, u)
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -606,6 +1045,20 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE, u)
         await msg.reply_text(LOCK_TEXT, parse_mode=ParseMode.HTML, reply_markup=build_lock_kb())
         return
 
+    # ✨ دکمه‌های جدید کاربر (دریافت ناشناس من / پنل مدیریت)
+    _text = (msg.text or "").strip()
+    if _text == BTN_MY_LINK:
+        STATES.pop(u.id, None)
+        await handle_my_link(update, context, u)
+        return
+    if _text == BTN_MY_PANEL:
+        STATES.pop(u.id, None)
+        await handle_my_panel(update, context, u)
+        return
+    if rate_limited(u.id):
+        await msg.reply_text(RATE_TEXT)
+        return
+
     uname = ("@" + u.username) if u.username else ""
     today_str = date_str()
     uinfo0 = DATA["users"].get(str(u.id), {})
@@ -614,12 +1067,30 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE, u)
 
     # 🔗 اگه کاربر روی دکمه «پاسخ» زده یا به پیام مدیر ریپلای داده → جواب همون پیامه
     thread_amid = None
+    owner_target = None
+    owner_thread_ref = None
     st_u = STATES.get(u.id)
     if st_u and st_u.get("mode") == "ureply":
         thread_amid = st_u.get("amid")
         STATES.pop(u.id, None)
+    elif st_u and st_u.get("mode") == "ureply_owner":
+        owner_target = int(st_u.get("owner") or 0)
+        owner_thread_ref = st_u.get("ref")
+        STATES.pop(u.id, None)
+    elif st_u and st_u.get("mode") == "oreply":
+        await do_owner_reply(update, context, u, st_u.get("key") or "")
+        return
     elif msg.reply_to_message:
         thread_amid = DATA.get("dst_map", {}).get(str(msg.reply_to_message.message_id))
+    if owner_target is None and thread_amid is None:
+        _pt = DATA.get("pending_target", {}).get(str(u.id))
+        if _pt:
+            owner_target = int(_pt)
+
+    # ✨ مسیر جدید: پیام ناشناس برای صاحب لینک
+    if owner_target:
+        await send_to_owner(update, context, u, owner_target, owner_thread_ref)
+        return
 
     try:
         await send(context, ADMIN_ID, NEW_MSG_HEADER)
@@ -808,6 +1279,24 @@ async def on_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t, kb = my_bots_panel()
         await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
+    if text == BTN_VIP:
+        STATES.pop(ADMIN_ID, None)
+        t, kb = vip_panel()
+        await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+    if text == BTN_SYS_STATS:
+        STATES.pop(ADMIN_ID, None)
+        t, kb = admin_stats_panel()
+        await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+    if text == BTN_MY_PANEL:
+        STATES.pop(ADMIN_ID, None)
+        await msg.reply_text("🎛 <b>پنل ادمین</b> 👇", parse_mode=ParseMode.HTML,
+                             reply_markup=panel_kb())
+        return
+    if text == BTN_MY_LINK:
+        await msg.reply_text("ℹ️ رئیس، همه پیام‌ها خودکار برای تو میاد؛ لینک ناشناس مخصوص کاربرانinale!")
+        return
     if text == "/cancel":
         STATES.pop(ADMIN_ID, None)
         await msg.reply_text("❌ لغو شد! برگشتی به پنل ✅", reply_markup=panel_kb())
@@ -941,6 +1430,57 @@ async def on_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 t, kb = search_results_panel(q, res)
                 await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
             return
+        if mode == "vip_add":
+            if not re.fullmatch(r"\d{4,13}", text):
+                await msg.reply_text("⚠️ آیدی عددی معتبر نیست! فقط رقم بفرست (مثل <code>123456789</code>)",
+                                     parse_mode=ParseMode.HTML)
+                return
+            vid = int(text)
+            if vid == BOT_INFO["id"]:
+                await msg.reply_text("⚠️ این آیدی خودِ رباته! آیدی کاربر رو بفرست 🙏")
+                return
+            if vid in DATA["vip"]:
+                STATES.pop(ADMIN_ID, None)
+                await msg.reply_text("ℹ️ این کاربر از قبل VIP هست! چیزی تغییر نکرد.")
+                return
+            DATA.setdefault("vip", []).append(vid)
+            known = str(vid) in DATA["users"]
+            if known:
+                DATA["users"][str(vid)]["vip_since"] = jdate_only()
+            STATES.pop(ADMIN_ID, None)
+            save_data()
+            log.info(f"💎 VIP added: {vid}")
+            note = "" if known else ("\n\nℹ️ این کاربر هنوز ربات رو استارت نکرده؛ "
+                                     "به محض اولین استارت، VIP میشه.")
+            t, kb = vip_info_panel(vid)
+            await msg.reply_text(f"✅ <b>کاربر <code>{vid}</code> به VIP اضافه شد!</b> 💎{note}",
+                                 parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+        if mode == "vip_search":
+            STATES.pop(ADMIN_ID, None)
+            q = (msg.text or "").strip()
+            if not q:
+                await msg.reply_text("⚠️ آیدی عددی، یوزرنیم یا اسم کاربر رو بفرست!")
+                return
+            if re.fullmatch(r"\d{4,13}", q):
+                vid = int(q)
+                if vid in DATA.get("vip", []):
+                    t, kb = vip_info_panel(vid)
+                    await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+                    return
+                await msg.reply_text(f"😕 کاربر <code>{html.escape(q)}</code> توی لیست VIP نیست!",
+                                     parse_mode=ParseMode.HTML)
+                return
+            res = [r for r in search_users(q) if int(r) in DATA.get("vip", [])]
+            if not res:
+                await msg.reply_text(f"😕 هیچ VIP ای برای «{html.escape(q)}» پیدا نشد!")
+                return
+            t, kb = vip_info_panel(int(res[0]))
+            await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+        if mode == "oreply":
+            await do_owner_reply(update, context, u, st.get("key") or "")
+            return
         if mode == "nb_tok":
             tok = text.strip()
             if not re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{30,}", tok):
@@ -1042,6 +1582,65 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send(context, uid, NOT_MEMBER_TEXT)
             return
 
+        # ✨ دکمه‌های کاربران (غیرادمینی) — همه با چک گیرنده/مالک در بک‌اند
+        if data.startswith("rpo:"):
+            # صاحب لینک روی «پاسخ» پیام ناشناس زده → فقط خود صاحب لینک
+            key = data.split(":", 1)[1]
+            ent = DATA.get("osrc_map", {}).get(key)
+            if not ent:
+                await cq.answer("⚠️ این پیام دیگه در دسترس نیست!", show_alert=True)
+                return
+            if ent.get("owner") != cq.from_user.id:
+                await cq.answer("⛔ فقط گیرنده‌ی پیام!", show_alert=True)
+                return
+            STATES[cq.from_user.id] = {"mode": "oreply", "key": key}
+            await cq.answer()
+            await send(context, cq.from_user.id,
+                       "✍️ <b>پاسخ ناشناس</b>\n\nپیامت رو بفرست تا دقیقاً جواب همون پیام ارسال شه 🕊️",
+                       reply_markup=cancel_kb())
+            return
+
+        if data.startswith("rpuo:"):
+            # فرستنده روی «پاسخ» زیر جواب صاحب لینک زده → فقط خودش
+            _p = data.split(":")
+            if len(_p) < 3:
+                await cq.answer("⚠️")
+                return
+            ref_mid = int(_p[1])
+            key = _p[2]
+            rq = cq.from_user.id
+            if cq.message.chat.id != rq:
+                await cq.answer("⛔ فقط گیرنده‌ی پیام!", show_alert=True)
+                return
+            ent = DATA.get("osrc_map", {}).get(key)
+            if not ent:
+                await cq.answer("⚠️ این گفتگو دیگه در دسترس نیست!", show_alert=True)
+                return
+            STATES[rq] = {"mode": "ureply_owner", "owner": ent["owner"], "ref": ref_mid}
+            await cq.answer()
+            await send(context, rq,
+                       "💬 <b>جوابِ همون پیام رو بنویس!</b>\n\n"
+                       "پیامت ناشناس می‌ره و دقیقاً جواب همون پیام می‌شینه 📩")
+            return
+
+        if data.startswith("rpu:"):
+            # کاربر روی دکمه «پاسخ» زیر پیام مدیر زده → پیام بعدیش جواب همون پیامه
+            try:
+                amid = int(data.split(":")[1])
+            except Exception:
+                await cq.answer("⚠️")
+                return
+            rq = cq.from_user.id
+            if cq.message.chat.id != rq:
+                await cq.answer("⛔ فقط گیرنده‌ی پیام!", show_alert=True)
+                return
+            STATES[rq] = {"mode": "ureply", "amid": amid}
+            await cq.answer()
+            await send(context, rq,
+                       "💬 <b>جوابِ همون پیام رو بنویس!</b>\n\n"
+                       "پیامت رو بفرست، دقیقاً به‌عنوان جواب همون پیام مدیر ارسال میشه 📩")
+            return
+
         # بقیه دکمه‌ها فقط برای ادمین
         if not is_admin(cq.from_user.id):
             await cq.answer("⛔ فقط ادمین!", show_alert=True)
@@ -1099,19 +1698,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.warning(f"manual fwd fail: {e}")
                 await cq.answer("⚠️ ارسال نشد! مطمئن شو ربات در چنل ادمینه 🙏", show_alert=True)
-
-        elif data.startswith("rpu:"):
-            # کاربر روی دکمه «پاسخ» زیر پیام مدیر زده → پیام بعدیش جواب همون پیامه
-            amid = int(data.split(":")[1])
-            rq = cq.from_user.id
-            if cq.message.chat.id != rq:
-                await cq.answer("⛔ فقط گیرنده‌ی پیام!", show_alert=True)
-                return
-            STATES[rq] = {"mode": "ureply", "amid": amid}
-            await cq.answer()
-            await send(context, rq,
-                       "💬 <b>جوابِ همون پیام رو بنویس!</b>\n\n"
-                       "پیامت رو بفرست، دقیقاً به‌عنوان جواب همون پیام مدیر ارسال میشه 📩")
 
         elif data.startswith("redit:"):
             uid = int(data.split(":")[1])
@@ -1286,6 +1872,62 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await cq.edit_message_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
             await cq.answer("🗑 حذف شد")
 
+        elif data == "vip_add":
+            STATES[ADMIN_ID] = {"mode": "vip_add"}
+            await cq.answer()
+            await send(context, ADMIN_ID,
+                       "💎 <b>افزودن کاربر VIP</b>\n\n"
+                       "لطفاً <b>آیدی عددی</b> کاربر رو بفرست:\n"
+                       "(مثل <code>123456789</code>)",
+                       parse_mode=ParseMode.HTML, reply_markup=cancel_kb())
+
+        elif data == "vip_list" or data.startswith("vip_page:"):
+            page = int(data.split(":")[1]) if ":" in data else 0
+            t, kb = vip_list_panel(page)
+            await cq.edit_message_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await cq.answer()
+
+        elif data == "vip_search":
+            STATES[ADMIN_ID] = {"mode": "vip_search"}
+            await cq.answer()
+            await send(context, ADMIN_ID,
+                       "🔍 <b>جستجوی VIP</b>\n\nآیدی عددی، یوزرنیم یا اسم کاربر رو بفرست:",
+                       reply_markup=cancel_kb())
+
+        elif data.startswith("vip_del:"):
+            try:
+                vid = int(data.split(":")[1])
+            except Exception:
+                await cq.answer("⚠️", show_alert=True)
+                return
+            if vid in DATA.get("vip", []):
+                DATA["vip"].remove(vid)
+                save_data()
+                log.info(f"💎 VIP removed: {vid}")
+                await cq.answer("➖ VIP حذف شد — کاربر و لینک و پیام‌هاش دست‌نخورده موندن ✅")
+            else:
+                await cq.answer("⚠️ این کاربر VIP نیست!", show_alert=True)
+            t, kb = vip_list_panel(0)
+            try:
+                await cq.edit_message_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            except Exception:
+                pass
+
+        elif data.startswith("vip_info:"):
+            try:
+                vid = int(data.split(":")[1])
+            except Exception:
+                await cq.answer("⚠️", show_alert=True)
+                return
+            t, kb = vip_info_panel(vid)
+            await cq.edit_message_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await cq.answer()
+
+        elif data == "vip_back":
+            t, kb = vip_panel()
+            await cq.edit_message_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await cq.answer()
+
         else:
             await cq.answer()
     except Exception:
@@ -1362,6 +2004,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("link", cmd_link))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageReactionHandler(on_reaction))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE & ~filters.COMMAND,
