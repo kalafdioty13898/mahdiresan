@@ -86,15 +86,20 @@ jobs:
           fi
 
       - name: Self-test (fail fast with visible logs)
+        id: selftest
         run: |
           timeout 45 python -u bot.py > selftest.log 2>&1; RC=$?
-          echo "─── خروجی بوت در self-test:"
-          tail -n 25 selftest.log || true
-          # ✅ معیار درست: «bot online» در لاگ = بوت سالم (PTB هنگام SIGTERM خروج تمیز rc=0 می‌دهد)
-          if grep -q "bot online" selftest.log; then
-            echo "✅ self-test OK — بوت آنلاین شد، حالا اجرای دائمی:"
+          echo "─── selftest.log (stdout/stderr):"
+          tail -n 15 selftest.log || true
+          echo "─── bot.log (لاگ اصلی بوت):"
+          tail -n 15 bot.log || true
+          # ✅ معیار درست: «bot online» در فایل bot.log (لاگ بوت در فایل می‌رود نه stdout)
+          if grep -q "bot online" bot.log; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "✅ self-test OK — بوت آنلاین شد"
           else
-            echo "❌ SELF-TEST FAILED (rc=$RC) — «bot online» دیده نشد"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "❌ SELF-TEST FAILED (rc=$RC) — «bot online» در bot.log دیده نشد"
             exit 1
           fi
           sleep 3
@@ -128,7 +133,8 @@ jobs:
             instances/*/data.json
 
       - name: Start next run with current state (24/7 chain)
-        if: always()
+        # فقط وقتی self-test سالم بود زنجیره ادامه یابد (جلوگیری از حلقه خطا)
+        if: always() && steps.selftest.outputs.ok == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
