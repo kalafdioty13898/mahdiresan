@@ -88,7 +88,10 @@ jobs:
       - name: Self-test (fail fast with visible logs)
         id: selftest
         run: |
-          timeout 45 python -u bot.py > selftest.log 2>&1; RC=$?
+          set +e
+          timeout 45 python -u bot.py > selftest.log 2>&1
+          RC=$?
+          set -e
           echo "─── selftest.log (stdout/stderr):"
           tail -n 15 selftest.log || true
           echo "─── bot.log (لاگ اصلی بوت):"
@@ -96,7 +99,7 @@ jobs:
           # ✅ معیار درست: «bot online» در فایل bot.log (لاگ بوت در فایل می‌رود نه stdout)
           if grep -q "bot online" bot.log; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
-            echo "✅ self-test OK — بوت آنلاین شد"
+            echo "✅ self-test OK — بوت آنلاین شد (rc=$RC طبیعی است)"
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
             echo "❌ SELF-TEST FAILED (rc=$RC) — «bot online» در bot.log دیده نشد"
