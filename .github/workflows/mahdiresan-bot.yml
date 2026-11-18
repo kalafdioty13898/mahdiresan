@@ -264,8 +264,9 @@ jobs:
             instances/*/data.json
 
       - name: Ensure next run dispatched (fallback)
-        # اگر dispatch زودهنگام به هر دلیلی موفق نشده بود، همین‌جا تلاش نهایی انجام می‌شود
-        if: always() && steps.selftest.outputs.ok == 'true' && steps.run.outputs.dispatched != '1'
+        # اگر dispatch زودهنگام به هر دلیلی موفق نشده بود، همین‌جا تلاش نهایی انجام می‌شود.
+        # !cancelled(): وقتی اجرا را دستی لغو می‌کنیم، نباید با state قدیمی اجرای جدید ساخته شود.
+        if: always() && !cancelled() && steps.selftest.outputs.ok == 'true' && steps.run.outputs.dispatched != '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
