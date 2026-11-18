@@ -7,13 +7,13 @@ on:
         required: false
         default: ""
   schedule:
-    - cron: "23 */12 * * *"   # نجات: اگر زنجیره قطع شده باشد، هر ۱۲ ساعت ربات را برمی‌گرداند
+    - cron: "*/20 * * * *"   # رسیکو: اگر زنجیره قطع شده باشد حداکثر ~۸۰ دقیقه بعد ربات برمی‌گردد
 concurrency:
   group: mahdiresan-run
   cancel-in-progress: false
 permissions:
-  contents: read
-  actions: write
+  contents: write   # heartbeat روزانه (جلوگیری از غیرفعال‌شدن schedule بعد از ۶۰ روز بی‌فعالیتی)
+  actions: write    # dispatch اجرای بعدی زنجیره
 jobs:
   bot:
     runs-on: ubuntu-latest
@@ -24,20 +24,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip   # نصب کش‌شده = راه‌اندازی سریع‌تر = خاموشی کمتر بین شیف‌تها
 
       - name: Install dependencies
-        run: pip install "python-telegram-bot~=21.11"
+        run: pip install -r requirements.txt
 
-      - name: Skip redundant scheduled run (chain is healthy)
+      - name: Skip redundant scheduled rescue (chain is healthy)
         if: inputs.state_b64 == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           A=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=botstate&per_page=1")
-          AGE_H=$(( ($(date +%s) - $(echo "$A" | jq -r '.artifacts[0].created_at // empty' | xargs -r date -d - +%s 2>/dev/null || echo 0)) / 3600 ))
-          if [ "$(echo "$A" | jq -r '.total_count // 0')" -gt 0 ] && [ "$AGE_H" -lt 7 ]; then
-            echo "chain is healthy (artifact ${AGE_H}h old) — cancelling this redundant run"
+          AGE_MIN=$(( ($(date +%s) - $(echo "$A" | jq -r '.artifacts[0].created_at // empty' | xargs -r date -d - +%s 2>/dev/null || echo 0)) / 60 ))
+          if [ "$(echo "$A" | jq -r '.total_count // 0')" -gt 0 ] && [ "$AGE_MIN" -lt 60 ]; then
+            echo "chain is healthy (artifact ${AGE_MIN}m old) — cancelling this redundant rescue run"
             gh run cancel "${{ github.run_id }}" --repo "${GITHUB_REPOSITORY}" || true
             sleep 30
           fi
@@ -53,7 +54,7 @@ jobs:
             | jq -r '.artifacts[0].run_id // empty')
           echo "run_id=$RID" >> "$GITHUB_OUTPUT"
 
-      - name: Restore state (dispatch input → artifact → fresh)
+      - name: Restore state (dispatch input → artifact → secrets)
         env:
           STATE_B64: ${{ inputs.state_b64 }}
           GH_TOKEN: ${{ github.token }}
@@ -65,69 +66,196 @@ jobs:
           elif [ -n "$PREV_RUN" ]; then
             AID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=botstate&per_page=1" \
-              | jq -r '.artifacts[0].id')
-            curl -sL -H "Authorization: Bearer $GH_TOKEN" -o a.zip \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/$AID/zip"
-            unzip -o -q a.zip -d restored
-            mv restored/state.tgz state.tgz 2>/dev/null || true
-            rm -rf restored a.zip
-            echo "✅ state از artifact پشتیبان بازیابی شد"
+              | jq -r '.artifacts[0].id // empty')
+            if [ -n "$AID" ] && [ "$AID" != "null" ]; then
+              curl -sL -H "Authorization: Bearer $GH_TOKEN" -o a.zip \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/$AID/zip"
+              unzip -o -q a.zip -d restored || echo "⚠️ artifact خراب بود — نادیده گرفته شد"
+              mv restored/state.tgz state.tgz 2>/dev/null || true
+              mv restored/config.json config.json 2>/dev/null || true
+              mv restored/data.json data.json 2>/dev/null || true
+              mkdir -p instances
+              cp -r restored/instances/* instances/ 2>/dev/null || true
+              rm -rf restored a.zip
+              echo "✅ state از artifact پشتیبان بازیابی شد"
+            else
+              echo "⚠️ artifact قبلی پیدا نشد یا منقضی شده — کانفیگ‌ها از Secrets ساخته می‌شوند"
+            fi
           else
-            echo "⚠️ state قبلی پیدا نشد — شروع با دیتای خالی"
+            echo "⚠️ state قبلی پیدا نشد — کانفیگ‌ها در مرحله بعد از Secrets ساخته می‌شوند"
           fi
           if [ -f state.tgz ]; then
             tar xzf state.tgz && rm -f state.tgz
             echo "state restored:"
             ls -la
           fi
+
+      - name: Bootstrap missing configs from Secrets
+        # اگر state گم شده باشد (مثلاً بعد از چند روز قطعی)، زنجیره باز هم برمی‌گردد:
+        # کانفیگ هر بات از Secret خودش ساخته می‌شود. داده‌های کاربران از artifact می‌آید.
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          BOT2_TOKEN: ${{ secrets.BOT2_TOKEN }}
+          BOT2_ADMIN_ID: ${{ secrets.BOT2_ADMIN_ID }}
+          BOT3_TOKEN: ${{ secrets.BOT3_TOKEN }}
+          BOT3_ADMIN_ID: ${{ secrets.BOT3_ADMIN_ID }}
+        run: |
+          mk() { # $1=path $2=token $3=admin_id
+            if [ -n "$2" ] && [ -n "$3" ] && [ ! -f "$1" ]; then
+              mkdir -p "$(dirname "$1")"
+              printf '{"token":"%s","admin_id":%s,"depth":0}\n' "$2" "$3" > "$1"
+              echo "🔐 created $1 from secrets"
+            fi
+          }
+          mk "config.json" "$BOT_TOKEN" "$ADMIN_ID"
+          mk "instances/Mf0815_ali_bot/config.json" "$BOT2_TOKEN" "$BOT2_ADMIN_ID"
+          mk "instances/N4shenas_setare_bot/config.json" "$BOT3_TOKEN" "$BOT3_ADMIN_ID"
           if [ ! -f config.json ]; then
-            echo "❌ config.json بعد از restore پیدا نشد — fail fast تا لاگ‌ها دیده شود"
+            echo "::error::نه state بود و نه Secret های BOT_TOKEN/ADMIN_ID — fail fast تا لاگ‌ها دیده شود"
             exit 1
           fi
 
-      - name: Self-test (fail fast with visible logs)
+      - name: Self-test + start all bots (بدون کشتن — همان پروسه‌ها تا انتهای شیفت زنده می‌مانند)
         id: selftest
         run: |
           set +e
-          timeout 45 python -u bot.py > selftest.log 2>&1
-          RC=$?
-          set -e
-          echo "─── selftest.log (stdout/stderr):"
-          tail -n 15 selftest.log || true
-          echo "─── bot.log (لاگ اصلی بوت):"
-          tail -n 15 bot.log || true
-          # ✅ معیار درست: «bot online» در فایل bot.log (لاگ بوت در فایل می‌رود نه stdout)
-          if grep -q "bot online" bot.log; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-            echo "✅ self-test OK — بوت آنلاین شد (rc=$RC طبیعی است)"
-          else
+          BOTS=("")
+          for c in instances/*/config.json; do
+            [ -f "$c" ] || continue
+            BOTS+=("$(dirname "$c" | xargs basename)")
+          done
+          echo "bots to start: [main ${BOTS[*]:1}]"
+          for b in "${BOTS[@]}"; do
+            if [ -z "$b" ]; then
+              rm -f bot.log
+              nohup python -u bot.py > run.main.out 2>&1 &
+              echo $! > main.pid
+              disown 2>/dev/null || true
+            else
+              mkdir -p "instances/$b"
+              rm -f "instances/$b/bot.log"
+              nohup python -u bot.py --instance "$b" > "instances/$b/run.out" 2>&1 &
+              echo $! > "instances/$b/pid"
+              disown 2>/dev/null || true
+            fi
+          done
+          deadline=$((SECONDS + 45))
+          while [ $SECONDS -lt $deadline ]; do
+            allok=true
+            for b in "${BOTS[@]}"; do
+              if [ -z "$b" ]; then f=bot.log; else f="instances/$b/bot.log"; fi
+              grep -q "bot online" "$f" 2>/dev/null || allok=false
+            done
+            $allok && break
+            sleep 2
+          done
+          ok=all
+          for b in "${BOTS[@]}"; do
+            if [ -z "$b" ]; then f=bot.log; n=main; else f="instances/$b/bot.log"; n="$b"; fi
+            if grep -q "bot online" "$f" 2>/dev/null; then
+              echo "✅ [$n] online: $(grep 'bot online' "$f" | tail -n1)"
+            else
+              echo "❌ [$n] online نشد — آخر لاگ:"
+              tail -n 12 "$f" 2>/dev/null || echo "(log یافت نشد)"
+              ok=failed
+            fi
+          done
+          if [ "$ok" != "all" ]; then
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "❌ SELF-TEST FAILED (rc=$RC) — «bot online» در bot.log دیده نشد"
+            echo "SELF-TEST FAILED — fail fast تا لاگ‌ها دیده شود"
             exit 1
           fi
-          sleep 3
+          echo "ok=true" >> "$GITHUB_OUTPUT"
 
-      - name: Run bot (24/7 keep-alive loop)
+      - name: Run bots (24/7 keep-alive + graceful chain handoff)
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          DEADLINE=$((SECONDS + 19200))
-          tail -f bot.log &
-          TAIL_PID=$!
-          while [ $SECONDS -lt $DEADLINE ]; do
-            python bot.py >> run.log 2>&1 || true
-            echo "$(date -u '+%FT%TZ') bot exited — restart in 10s" >> run.log
-            sleep 10
+          BOTS=("")
+          for c in instances/*/config.json; do
+            [ -f "$c" ] || continue
+            BOTS+=("$(dirname "$c" | xargs basename)")
           done
-          kill $TAIL_PID 2>/dev/null || true
+          start_bot() { # $1 = instance name or "" for main
+            if [ -z "$1" ]; then
+              nohup python -u bot.py > run.main.out 2>&1 &
+              echo $! > main.pid
+            else
+              nohup python -u bot.py --instance "$1" > "instances/$1/run.out" 2>&1 &
+              echo $! > "instances/$1/pid"
+            fi
+            disown 2>/dev/null || true
+          }
+          DEADLINE=$((SECONDS + 19200))      # ~۵ ساعت و ۲۰ دقیقه (۳۰ دقیقه قبل از سقف ۳۵۰ دقیقه‌ای جاب)
+          DISPATCH_AT=$((DEADLINE - 180))    # dispatch زودهنگام: اجرای بعدی از الان در صف می‌ماند
+          STOP_AT=$((DEADLINE - 15))
+          dispatched=0
+          while [ $SECONDS -lt $DEADLINE ]; do
+            # ─── dispatch زودهنگام برای handoff کم‌وقفه ───
+            if [ $dispatched -eq 0 ] && [ $SECONDS -ge $DISPATCH_AT ]; then
+              tar czf state.tgz config.json data.json instances/*/config.json instances/*/data.json 2>/dev/null \
+                || tar czf state.tgz config.json data.json
+              B64=$(base64 -w0 state.tgz)
+              jq -n --arg s "$B64" '{"ref":"main","inputs":{"state_b64":$s}}' > payload.json
+              CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/mahdiresan-bot.yml/dispatches" \
+                --data @payload.json) || CODE=000
+              echo "early dispatch: HTTP $CODE"
+              if [ "$CODE" = "204" ]; then
+                dispatched=1
+              else
+                sleep 20
+              fi
+              rm -f state.tgz payload.json
+            fi
+            # ─── پایان شیفت: SIGTERM → داخل bot.py به ادمین هر بات خبر داده می‌شود ───
+            if [ $SECONDS -ge $STOP_AT ]; then
+              echo "shift ending — SIGTERM به همه بات‌ها (پیام ادمین داخل bot.py ارسال می‌شود)"
+              if [ -f main.pid ] && kill -0 "$(cat main.pid)" 2>/dev/null; then
+                kill -TERM "$(cat main.pid)" 2>/dev/null || true
+              fi
+              for b in "${BOTS[@]:1}"; do
+                if [ -f "instances/$b/pid" ] && kill -0 "$(cat instances/$b/pid)" 2>/dev/null; then
+                  kill -TERM "$(cat instances/$b/pid)" 2>/dev/null || true
+                fi
+              done
+              sleep 20
+              # لایه پشتیبان: اگر باتی هنگ کرده بود و پیام نرفته بود، اسکریپت خودش می‌فرستد
+              for b in "${BOTS[@]:1}"; do
+                if [ -f "instances/$b/pid" ] && kill -0 "$(cat instances/$b/pid)" 2>/dev/null; then
+                  python3 scripts/notify_admin.py "instances/$b/config.json" || true
+                fi
+              done
+              break
+            fi
+            # ─── سرپرستی: اگر باتی مرد، ۱۰ ثانیه بعد دوباره روشن می‌شود ───
+            for b in "${BOTS[@]}"; do
+              if [ -z "$b" ]; then pf=main.pid; args=""; rlog=run.main.out
+              else pf="instances/$b/pid"; args="--instance $b"; rlog="instances/$b/run.out"; fi
+              alive=false
+              if [ -f "$pf" ]; then kill -0 "$(cat "$pf")" 2>/dev/null && alive=true; fi
+              if ! $alive; then
+                echo "$(date -u '+%FT%TZ') [$b] died — restart in 10s" | tee -a "$rlog"
+                sleep 10
+                start_bot "$b"
+              fi
+            done
+            sleep 15
+          done
           echo "=== آخر bot.log ==="
-          tail -n 40 bot.log || true
-          echo "clean deadline exit — passing state to next run"
+          tail -n 25 bot.log 2>/dev/null || true
+          echo "dispatched=$dispatched" >> "$GITHUB_OUTPUT"
+          echo "clean shift exit — state به اجرای بعدی پاس داده می‌شود"
 
       - name: Save state artifact (backup)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: botstate
-          retention-days: 1
+          retention-days: 2
           if-no-files-found: ignore
           path: |
             config.json
@@ -135,9 +263,9 @@ jobs:
             instances/*/config.json
             instances/*/data.json
 
-      - name: Start next run with current state (24/7 chain)
-        # فقط وقتی self-test سالم بود زنجیره ادامه یابد (جلوگیری از حلقه خطا)
-        if: always() && steps.selftest.outputs.ok == 'true'
+      - name: Ensure next run dispatched (fallback)
+        # اگر dispatch زودهنگام به هر دلیلی موفق نشده بود، همین‌جا تلاش نهایی انجام می‌شود
+        if: always() && steps.selftest.outputs.ok == 'true' && steps.run.outputs.dispatched != '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -149,5 +277,10 @@ jobs:
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/mahdiresan-bot.yml/dispatches" \
             --data @payload.json)
-          echo "dispatch next run: HTTP $CODE"
+          echo "fallback dispatch: HTTP $CODE"
           rm -f state.tgz payload.json
+
+      - name: Daily heartbeat commit
+        # هر روز یک کامیت کوچک تا ریپو «فعال» بماند و گیت‌هاب schedule را غیرفعال نکند
+        if: success() && steps.selftest.outputs.ok == 'true'
+        run: bash scripts/heartbeat.sh

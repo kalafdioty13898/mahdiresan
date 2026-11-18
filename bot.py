@@ -46,15 +46,36 @@ if "--instance" in sys.argv:
     INSTANCE_NAME = sys.argv[_i + 1]
     _idir = os.path.join(BASE, "instances", re.sub(r"[^A-Za-z0-9_]", "_", INSTANCE_NAME))
     os.makedirs(_idir, exist_ok=True)
-    with open(os.path.join(_idir, "config.json"), encoding="utf-8") as f:
-        CFG = json.load(f)
+    CFG_PATH = os.path.join(_idir, "config.json")
     DATA_PATH = os.path.join(_idir, "data.json")
     LOG_PATH = os.path.join(_idir, "bot.log")
 else:
-    with open(os.path.join(BASE, "config.json"), encoding="utf-8") as f:
-        CFG = json.load(f)
+    CFG_PATH = os.path.join(BASE, "config.json")
     DATA_PATH = os.path.join(BASE, "data.json")
     LOG_PATH = os.path.join(BASE, "bot.log")
+
+
+def _load_cfg(path: str) -> dict:
+    """config.json را می‌خواند؛ اگر نبود از BOT_TOKEN/ADMIN_ID محیط می‌سازد و ذخیره می‌کند.
+    این یعنی حتی اگر artifact زنجیره گم شده باشد، اجرای جدید روی GitHub Actions از Secrets
+    دوباره بالا می‌آید و زنجیره هیچ‌وقت به‌طور دائمی نمی‌شکند."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        pass
+    _tok = os.environ.get("BOT_TOKEN", "")
+    _adm = os.environ.get("ADMIN_ID", "")
+    if not _tok or not _adm:
+        raise SystemExit(f"❌ config.json پیدا نشد: {path} — و BOT_TOKEN/ADMIN_ID هم در محیط ست نشده")
+    cfg = {"token": _tok, "admin_id": int(_adm),
+           "depth": int(os.environ.get("DEPTH", "0"))}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=1)
+    return cfg
+
+
+CFG = _load_cfg(CFG_PATH)
 TOKEN = CFG["token"]
 ADMIN_ID = int(CFG["admin_id"])
 DEPTH = int(CFG.get("depth", 0))
@@ -1973,6 +1994,38 @@ async def on_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ---------------- startup ----------------
+SHUTDOWN_NOTICE = "⚙️ ربات درحال خالی سازی فضای رم تا چند دقیقه دیگر ربات روشن میشود"
+
+def _tg_send_text(token: str, chat_id: int, text: str) -> bool:
+    """ارسال مستقیم متن با urllib — مستقل از کلاینت داخلی بوت (برای لحظه خاموشی مناسب‌تر است)."""
+    try:
+        req = UrlRequest(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with url_open(req, timeout=10) as r:
+            j = json.loads(r.read().decode("utf-8"))
+        return bool(j.get("ok"))
+    except Exception as e:
+        log.warning(f"tg_send_text fail: {e}")
+        return False
+
+def install_shutdown_notice():
+    """روی SIGTERM/SIGINT (خاموشی برنامه‌ریزی‌شده توسط workflow یا دستی):
+    اول به ادمینِ همین بات خبر می‌دهد، بعد مسیر خاموشی تمیز خود PTB ادامه پیدا می‌کند."""
+    loop = asyncio.get_running_loop()
+
+    def _on_stop_signal(_sig=None):
+        log.info("⏹ stop signal — notify admin before shutdown")
+        _tg_send_text(TOKEN, ADMIN_ID, SHUTDOWN_NOTICE)
+        raise SystemExit  # همان مسیر خود PTB برای خاموشی تمیز
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_stop_signal)
+        except NotImplementedError:
+            pass
+
 async def post_init(app: Application):
     me = await app.bot.get_me()
     BOT_INFO.update({"id": me.id, "username": me.username or "", "name": me.first_name or "ربات"})
@@ -1988,6 +2041,7 @@ async def post_init(app: Application):
     except Exception as e:
         log.info(f"admin name fetch skipped: {getattr(e, 'message', '')}")
     respawn_children()
+    install_shutdown_notice()
     app.create_task(heartbeat())
 
 async def heartbeat():
